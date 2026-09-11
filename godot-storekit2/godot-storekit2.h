@@ -4,6 +4,7 @@
 
 #include "core/string/ustring.h"
 #include "core/variant/dictionary.h"
+#include "core/variant/type_info.h"
 
 @class GodotStoreKit2Proxy;
 @class TransactionData;
