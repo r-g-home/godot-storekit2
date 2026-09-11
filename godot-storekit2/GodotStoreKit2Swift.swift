@@ -1,223 +1,368 @@
 import Foundation
 import StoreKit
 
+// StoreKit 2 for Godot - the Crystal Tempest fork.
+//
+// StoreKit 2 is Swift-only, so this proxy does the StoreKit work and hands
+// every result to the Godot class (godot-storekit2.mm) as a dictionary event
+// through `emit`. The Godot side moves each event onto the main queue - the
+// thread Godot's main loop runs on - and queues it for polling.
+//
+// What the fork exists for:
+//  - Nothing here ever finishes a transaction on its own. The game records a
+//    purchase first and only then calls finishTransaction, so a transaction
+//    the app dies holding stays unfinished and is delivered again by start().
+//  - Every delivered transaction carries its id and dates, so the game can
+//    count a purchase exactly once.
+//  - restorePurchases() replays what the account owns, after AppStore.sync().
+//
+// Only VerificationResult.verified transactions are delivered as
+// "transaction". An unverified one is reported as "transaction_unverified"
+// for the logs, and is never finished.
 @objcMembers
-public final class GodotStoreKit2Proxy: NSObject,
-@unchecked Sendable
-{
-	private var updates: Task<Void, Never>? = nil
-	private var unfinished: Task<Void, Never>? = nil
-	private var transactionCallback: (TransactionData) -> ()
+public final class GodotStoreKit2Proxy: NSObject, @unchecked Sendable {
+	private let emitEvent: @Sendable (NSDictionary) -> Void
 
-	public init(transactionCallback: @Sendable @escaping (TransactionData) -> ()) {
-		self.transactionCallback = transactionCallback
+	// Guards the state below. Only taken inside locked(), which is
+	// synchronous, so it is never held across an await.
+	private let lock = NSLock()
+	private var products: [String: Product] = [:]
+	// Verified transactions delivered to the game, by id, so that
+	// finishTransaction has the object StoreKit needs.
+	private var held: [UInt64: Transaction] = [:]
+	private var updates: Task<Void, Never>? = nil
+
+	public init(emit: @escaping @Sendable (NSDictionary) -> Void) {
+		emitEvent = emit
 		super.init()
-		updates = newTransactionListenerTask(transactions: Transaction.updates)
-		unfinished = newTransactionListenerTask(transactions: Transaction.unfinished)
 	}
 
 	deinit {
-		// Cancel the update handling task when you deinitialize the class.
 		updates?.cancel()
 	}
 
-	private func newTransactionListenerTask(transactions: Transaction.Transactions) -> Task<Void, Never> {
-		Task(priority: .background) { @Sendable [weak self] in
-			for await verificationResult in transactions {
-				self?.handle(updatedTransaction: verificationResult)
+	public func canMakePayments() -> Bool {
+		return AppStore.canMakePayments
+	}
+
+	// Starts listening to Transaction.updates (Ask to Buy approvals, purchases
+	// made on another device, refunds), then delivers every unfinished
+	// transaction and the current entitlements. Apple wants the listener
+	// running from launch. A second call does nothing.
+	public func start() {
+		let alreadyStarted: Bool = locked {
+			if updates != nil {
+				return true
 			}
-		}
-	}
-
-	private func handle(updatedTransaction verificationResult: VerificationResult<Transaction>) {
-		guard case .verified(let transaction) = verificationResult else {
-			// Ignore unverified transactions.
-			return
-		}
-
-		let transData = TransactionData()
-		transData.productId = transaction.productID
-
-		if let revocationDate = transaction.revocationDate {
-			// Remove access to the product identified by transaction.productID.
-			// Transaction.revocationReason provides details about
-			// the revoked transaction.
-			transData.transactionState = TransactionState.Refunded.rawValue
-			transData.revocationDate = revocationDate
-		} else if let expirationDate = transaction.expirationDate,
-				  expirationDate < Date() {
-			// Do nothing, this subscription is expired.
-			return
-		} else if transaction.isUpgraded {
-			// Do nothing, there is an active transaction
-			// for a higher level of service.
-			return
-		} else {
-			// Provide access to the product identified by
-			// transaction.productID.
-			transData.transactionState = TransactionState.Purchased.rawValue
-			transData.purchaseDate = transaction.purchaseDate
-		}
-
-		self.transactionCallback(transData)
-	}
-
-	public func test() -> Bool {
-		return true;
-	}
-
-	public func isProductAvailable(productId: NSString) -> Bool {
-		return false;
-	}
-
-	public func isProductPurchased(productId: NSString) -> Bool {
-		return false;
-	}
-
-	private func priceInfoFromProduct(product: Product) -> PriceInfo {
-		let info = PriceInfo()
-		info.currencyValue = product.price as NSDecimalNumber
-		info.localizedDisplay = product.displayPrice
-		info.currencyCode = product.priceFormatStyle.currencyCode
-
-		// Get the currency symbol.
-		let currencyCode = product.priceFormatStyle.currencyCode
-		let locale = product.priceFormatStyle.locale
-		let formatter = NumberFormatter()
-		formatter.numberStyle = .currency
-		formatter.currencyCode = currencyCode
-		formatter.locale = locale
-		let currencySymbol = formatter.currencySymbol
-		info.currencySymbol = currencySymbol!
-
-		return info
-	}
-
-	public func getProductInfo(productId: NSString) async throws -> ProductInfo {
-		let productIdentifiers: Set<String> = [productId as String]
-		let appProducts = try await Product.products(for: productIdentifiers)
-		guard let product = appProducts.first else {
-			throw NSError(domain: "GodotStoreKit2Proxy", code: 1, userInfo: [NSLocalizedDescriptionKey: "Product not found"])
-		}
-
-		let info = ProductInfo()
-		info.productId = product.id
-		info.displayName = product.displayName
-		info.productDescription = product.description
-		info.priceInfo = priceInfoFromProduct(product: product)
-
-		if #available(iOS 18.4, *) {
-			for await verificationResult in product.currentEntitlements {
-				switch verificationResult {
-				case .verified(_):
-					info.isPurchased = true
-				default:
-					info.isPurchased = false
+			updates = Task(priority: .background) { [weak self] in
+				for await result in Transaction.updates {
+					guard let self else {
+						return
+					}
+					self.deliver(result, source: "update")
+					await self.emitEntitlements()
 				}
 			}
-		} else {
-			let entitlement = await product.currentEntitlement
-			switch entitlement {
-			case .verified(_):
-				info.isPurchased = true
-			default:
-				info.isPurchased = false
+			return false
+		}
+		if alreadyStarted {
+			return
+		}
+		Task {
+			for await result in Transaction.unfinished {
+				deliver(result, source: "unfinished")
+			}
+			await emitEntitlements()
+		}
+	}
+
+	public func requestProducts(_ productIds: [String]) {
+		Task {
+			do {
+				let found = try await Product.products(for: productIds)
+				locked {
+					for product in found {
+						products[product.id] = product
+					}
+				}
+				let foundIds = Set(found.map { $0.id })
+				emit([
+					"type": "products",
+					"result": "ok",
+					"products": found.map { productInfo($0) },
+					"invalid_ids": productIds.filter { !foundIds.contains($0) },
+				])
+			} catch {
+				emit(["type": "products", "result": "error", "error": error.localizedDescription])
 			}
 		}
-
-		return info
 	}
 
-	public func getProductPrice(productId: NSString) async throws -> PriceInfo {
-		let productIdentifiers: Set<String> = [productId as String]
-		let appProducts = try await Product.products(for: productIdentifiers)
-		guard let product = appProducts.first else {
-			throw NSError(domain: "GodotStoreKit2Proxy", code: 1, userInfo: [NSLocalizedDescriptionKey: "Product not found"])
+	// Shows the App Store's purchase sheet. A verified purchase is delivered
+	// as a "transaction" event BEFORE its "purchase" event.
+	public func purchase(productId: String) {
+		Task {
+			do {
+				guard let product = try await loadProduct(productId) else {
+					emitPurchase(productId, "failed", error: "Product not found: \(productId)")
+					return
+				}
+				let result = try await product.purchase()
+				switch result {
+				case .success(let verification):
+					switch verification {
+					case .verified(let transaction):
+						deliver(verification, source: "purchase")
+						emitPurchase(productId, "purchased", transactionId: String(transaction.id))
+					case .unverified(let transaction, let verificationError):
+						emitUnverified(transaction, source: "purchase", error: verificationError)
+						emitPurchase(productId, "failed", transactionId: String(transaction.id),
+								error: "The purchase could not be verified.")
+					}
+				case .pending:
+					emitPurchase(productId, "pending")
+				case .userCancelled:
+					emitPurchase(productId, "cancelled")
+				@unknown default:
+					emitPurchase(productId, "failed", error: "Unknown purchase result.")
+				}
+			} catch StoreKitError.userCancelled {
+				emitPurchase(productId, "cancelled")
+			} catch {
+				emitPurchase(productId, "failed", error: error.localizedDescription)
+			}
 		}
-
-		return priceInfoFromProduct(product: product)
 	}
 
-	public func purchaseProduct(productId: String, quantity: Int) async throws -> TransactionData {
-		let productIdentifiers: Set<String> = [productId]
-		let appProducts = try await Product.products(for: productIdentifiers)
-		guard let product = appProducts.first else {
-			throw NSError(domain: "GodotStoreKit2Proxy", code: 1, userInfo: [NSLocalizedDescriptionKey: "Product not found"])
+	// Tells StoreKit the transaction is recorded. Only the game calls this,
+	// and only once it has recorded the purchase.
+	public func finishTransaction(transactionId: String) {
+		Task {
+			guard let id = UInt64(transactionId) else {
+				emitFinish(transactionId, error: "Not a StoreKit transaction id.")
+				return
+			}
+			var transaction: Transaction? = locked { held[id] }
+			if transaction == nil {
+				// Not delivered during this run - look among StoreKit's own
+				// unfinished transactions.
+				for await result in Transaction.unfinished {
+					if case .verified(let candidate) = result, candidate.id == id {
+						transaction = candidate
+						break
+					}
+				}
+			}
+			guard let transaction else {
+				emitFinish(transactionId, error: "No unfinished transaction with that id.")
+				return
+			}
+			await transaction.finish()
+			locked {
+				held[id] = nil
+			}
+			emitFinish(transactionId, productId: transaction.productID)
 		}
+	}
 
-		let result = try await product.purchase(options: [
-			.quantity(quantity)
+	// The player's Restore Purchases: AppStore.sync(), then replay through
+	// "transaction" events exactly
+	//  - the non-consumables the account owns (currentEntitlements), and
+	//  - every unfinished transaction,
+	// then the entitlements, then the "restore" event. A finished consumable
+	// is never replayed: consumables are skipped in currentEntitlements, and
+	// only reach the game from Transaction.unfinished.
+	public func restorePurchases() {
+		Task {
+			var result = "ok"
+			var syncError: String? = nil
+			do {
+				try await AppStore.sync()
+			} catch StoreKitError.userCancelled {
+				result = "cancelled"
+			} catch {
+				result = "error"
+				syncError = error.localizedDescription
+			}
+
+			// Replayed whether or not the sync worked: what this device already
+			// knows is still true, and the game counts each transaction once.
+			var replayed = Set<UInt64>()
+			for await entitlement in Transaction.currentEntitlements {
+				if case .verified(let transaction) = entitlement,
+						transaction.productType != .consumable,
+						transaction.revocationDate == nil,
+						replayed.insert(transaction.id).inserted {
+					deliver(entitlement, source: "restore")
+				}
+			}
+			for await unfinished in Transaction.unfinished {
+				if case .verified(let transaction) = unfinished,
+						replayed.insert(transaction.id).inserted {
+					deliver(unfinished, source: "restore")
+				}
+			}
+			await emitEntitlements()
+
+			var event: [String: Any] = ["type": "restore", "result": result]
+			if let syncError {
+				event["error"] = syncError
+			}
+			emit(event)
+		}
+	}
+
+	public func refreshEntitlements() {
+		Task {
+			await emitEntitlements()
+		}
+	}
+
+	// MARK: - Events
+
+	private func deliver(_ result: VerificationResult<Transaction>, source: String) {
+		switch result {
+		case .verified(let transaction):
+			locked {
+				held[transaction.id] = transaction
+			}
+			emit(transactionEvent(transaction, source: source))
+		case .unverified(let transaction, let error):
+			emitUnverified(transaction, source: source, error: error)
+		}
+	}
+
+	// The non-consumable, unrevoked, unexpired products the account owns.
+	private func emitEntitlements() async {
+		var owned = Set<String>()
+		for await result in Transaction.currentEntitlements {
+			guard case .verified(let transaction) = result,
+					transaction.productType != .consumable,
+					transaction.revocationDate == nil else {
+				continue
+			}
+			if let expiry = transaction.expirationDate, expiry < Date() {
+				continue
+			}
+			owned.insert(transaction.productID)
+		}
+		emit(["type": "entitlements", "result": "ok", "product_ids": owned.sorted()])
+	}
+
+	private func transactionEvent(_ transaction: Transaction, source: String) -> [String: Any] {
+		var event: [String: Any] = [
+			"type": transaction.revocationDate == nil ? "transaction" : "transaction_revoked",
+			"source": source,
+			"transaction_id": String(transaction.id),
+			"original_transaction_id": String(transaction.originalID),
+			"product_id": transaction.productID,
+			"product_type": productTypeName(transaction.productType),
+			"purchase_date_ms": milliseconds(transaction.purchaseDate),
+			"quantity": transaction.purchasedQuantity,
+			"family_shared": transaction.ownershipType == .familyShared,
+		]
+		if let revocationDate = transaction.revocationDate {
+			event["revocation_date_ms"] = milliseconds(revocationDate)
+		}
+		if #available(iOS 16.0, *) {
+			event["environment"] = transaction.environment.rawValue
+		}
+		return event
+	}
+
+	private func emitUnverified(_ transaction: Transaction, source: String,
+			error: VerificationResult<Transaction>.VerificationError) {
+		emit([
+			"type": "transaction_unverified",
+			"source": source,
+			"transaction_id": String(transaction.id),
+			"product_id": transaction.productID,
+			"error": error.localizedDescription,
 		])
+	}
 
-		let data = TransactionData()
-		data.productId = productId
-		switch result{
-		case .pending:
-			data.transactionState = TransactionState.Pending.rawValue
-		case .userCancelled:
-			data.transactionState = TransactionState.Canceled.rawValue
-		case .success(let verificationResult):
-			switch verificationResult {
-			case .verified(let transaction):
-				await transaction.finish()
-				data.transactionState = TransactionState.Purchased.rawValue
-			case .unverified(let transaction, let verificationError):
-				await transaction.finish()
-				data.transactionState = TransactionState.Failed.rawValue
-				data.error = verificationError.errorDescription!
-			}
-		@unknown default:
-			data.error = "unknown"
-			data.transactionState = TransactionState.Failed.rawValue
+	private func emitPurchase(_ productId: String, _ result: String,
+			transactionId: String? = nil, error: String? = nil) {
+		var event: [String: Any] = ["type": "purchase", "result": result, "product_id": productId]
+		if let transactionId {
+			event["transaction_id"] = transactionId
 		}
-		return data
+		if let error {
+			event["error"] = error
+		}
+		emit(event)
 	}
 
-	public func restorePurchases() async throws -> Void {
-		try await AppStore.sync()
+	private func emitFinish(_ transactionId: String, productId: String? = nil, error: String? = nil) {
+		var event: [String: Any] = [
+			"type": "finish",
+			"result": error == nil ? "ok" : "error",
+			"transaction_id": transactionId,
+		]
+		if let productId {
+			event["product_id"] = productId
+		}
+		if let error {
+			event["error"] = error
+		}
+		emit(event)
 	}
-}
 
-// Keep in sync wit C++ enum.
-public enum TransactionState: Int {
-	case Failed = 0
-	case Refunded = 1
-	case Pending = 2
-	case Deferred = 3
-	case Purchased = 4
-	case Restored = 5
-	case Expired = 6
-	case Canceled = 7
-};
+	private func emit(_ event: [String: Any]) {
+		emitEvent(event as NSDictionary)
+	}
 
-@objcMembers
-public class PriceInfo: NSObject {
-	public var currencyValue: NSDecimalNumber = 0.0
-	public var currencyCode = ""
-	public var currencySymbol = "$"
-	public var localizedDisplay = ""
-}
+	// MARK: - Helpers
 
-@objcMembers
-public class InitializationData: NSObject {
-	var initialized: Bool = false;
-	public var error = ""
-}
+	private func locked<T>(_ body: () -> T) -> T {
+		lock.lock()
+		defer {
+			lock.unlock()
+		}
+		return body()
+	}
 
-@objcMembers
-public class TransactionData: NSObject {
-	public var productId = ""
-	public var transactionState = TransactionState.Failed.rawValue
-	public var error = ""
-	public var purchaseDate: Date? = nil
-	public var revocationDate: Date? = nil
-}
+	private func loadProduct(_ productId: String) async throws -> Product? {
+		if let cached = locked({ products[productId] }) {
+			return cached
+		}
+		guard let product = try await Product.products(for: [productId]).first else {
+			return nil
+		}
+		locked {
+			products[productId] = product
+		}
+		return product
+	}
 
-@objcMembers
-public class ProductInfo: NSObject {
-	public var productId = ""
-	public var displayName = ""
-	public var productDescription = ""
-	public var isPurchased = false
-	public var priceInfo = PriceInfo()
+	private func productInfo(_ product: Product) -> [String: Any] {
+		return [
+			"product_id": product.id,
+			"display_name": product.displayName,
+			"description": product.description,
+			"display_price": product.displayPrice,
+			"price": NSDecimalNumber(decimal: product.price).doubleValue,
+			"currency_code": product.priceFormatStyle.currencyCode,
+			"product_type": productTypeName(product.type),
+		]
+	}
+
+	private func productTypeName(_ type: Product.ProductType) -> String {
+		switch type {
+		case .consumable:
+			return "consumable"
+		case .nonConsumable:
+			return "non_consumable"
+		case .autoRenewable:
+			return "auto_renewable"
+		case .nonRenewable:
+			return "non_renewing"
+		default:
+			return type.rawValue
+		}
+	}
+
+	private func milliseconds(_ date: Date) -> Int64 {
+		return Int64((date.timeIntervalSince1970 * 1000).rounded())
+	}
 }

@@ -1,44 +1,41 @@
 #pragma once
 
-#include "core/object/ref_counted.h"
-
-#include "core/string/ustring.h"
-#include "core/variant/dictionary.h"
-#include "core/variant/type_info.h"
+#include "core/object/class_db.h"
+#include "core/templates/list.h"
 
 @class GodotStoreKit2Proxy;
-@class TransactionData;
-@class InitializationData;
 
-class GodotStoreKit2 : public RefCounted {
-	GDCLASS(GodotStoreKit2, RefCounted)
+// StoreKit 2 for Godot - the Crystal Tempest fork. See README.md.
+//
+// Registered as the engine singleton "StoreKit2". Every asynchronous result
+// arrives as a Dictionary event, queued on Godot's main thread and read with
+// get_pending_event_count() / pop_pending_event() - the same model as the
+// godot-ios-plugins GameCenter plugin.
+class GodotStoreKit2 : public Object {
+	GDCLASS(GodotStoreKit2, Object);
 
-	GodotStoreKit2Proxy *proxy;
-
+	static GodotStoreKit2 *instance;
 	static void _bind_methods();
 
-	void _on_transaction_state_changed(TransactionData *data);
+	GodotStoreKit2Proxy *proxy;
+	List<Variant> pending_events;
 
 public:
-	// Keep in sync with Swiftenum.
-	enum TransactionState {
-		FAILED,
-		REFUNDED,
-		PENDING,
-		DEFERRED,
-		PURCHASED,
-		RESTORED,
-		EXPIRED,
-		CANCELED,
-	};
+	bool can_make_payments();
+	void start();
+	void request_products(PackedStringArray p_product_ids);
+	void purchase(String p_product_id);
+	void finish_transaction(String p_transaction_id);
+	void restore_purchases();
+	void refresh_entitlements();
+	String get_plugin_version();
 
-	bool is_product_available(String p_product_id);
-	bool is_product_purchased(String p_product_id);
-	Signal request_product_info(String p_product_id);
-	Signal request_product_price(String p_product_id);
-	Signal purchase_product(String p_product_id, int p_quantity = 1);
-	Signal sync();
+	void push_pending_event(const Variant &p_event);
+	int get_pending_event_count();
+	Variant pop_pending_event();
+
+	static GodotStoreKit2 *get_singleton();
+
 	GodotStoreKit2();
+	~GodotStoreKit2();
 };
-
-VARIANT_ENUM_CAST(GodotStoreKit2::TransactionState)

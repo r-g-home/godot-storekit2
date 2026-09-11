@@ -3,3 +3,4 @@ Pods/
 
 # Build artifacts
 /bin/
+/godot-storekit2/plugin_version.gen.h

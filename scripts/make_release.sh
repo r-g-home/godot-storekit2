@@ -9,6 +9,14 @@ if [[ $(find godot -name '*.gen.h' | wc -l | awk '{$1=$1};1') == 0 ]]; then
 	./scripts/generate_headers.sh
 fi
 
+# Stamp the fork's git revision for get_plugin_version(), so the game can report
+# which plugin build it links. "+" marks a dirty tree. The header is gitignored.
+REV=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+if [[ "$REV" != unknown && -n "$(git status --porcelain --ignore-submodules=dirty)" ]]; then
+	REV="$REV+"
+fi
+echo "#define STOREKIT2_PLUGIN_VERSION \"$REV\"" > ${PLUGIN_NAME}/plugin_version.gen.h
+
 # Build archives
 xcrun xcodebuild archive -project ${PLUGIN_NAME}.xcodeproj -scheme ${PLUGIN_NAME} -destination "generic/platform=iOS" -archivePath "bin/archives/${PLUGIN_NAME}.debug" -configuration Debug
 xcrun xcodebuild archive -project ${PLUGIN_NAME}.xcodeproj -scheme ${PLUGIN_NAME} -destination "generic/platform=iOS" -archivePath "bin/archives/${PLUGIN_NAME}.release" -configuration Release

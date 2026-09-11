@@ -8,7 +8,8 @@ if [ -z "$PLUGIN_VERSION" ]; then
 	exit 1
 fi
 
-GODOT_VERSIONS="4.4 4.4.1 4.5 4.5.1 4.5.2 4.6 4.6.1 4.6.2"
+# The Crystal Tempest fork is built and tested against 4.7.2 only.
+GODOT_VERSIONS="4.7.2"
 PLUGIN_NAME=godot-storekit2
 
 cd godot
